@@ -1,6 +1,11 @@
 name: Android Build
 
 on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -24,6 +29,13 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           validate-wrappers: false
+          cache-disabled: true
+
+      - name: Clean repo Gradle state
+        run: rm -rf .gradle
+
+      - name: Clean wrapper dists
+        run: rm -rf /home/runner/.gradle/wrapper/dists
 
       - name: Grant execute permission
         run: chmod +x gradlew
