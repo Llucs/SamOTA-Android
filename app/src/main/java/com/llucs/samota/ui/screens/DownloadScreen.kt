@@ -1,5 +1,10 @@
 package com.llucs.samota.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,8 +30,12 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -34,6 +43,19 @@ import kotlin.math.roundToInt
 fun DownloadScreen(vm: DownloadViewModel) {
     val state = vm.state
     val scroll = rememberScrollState()
+    val ctx = LocalContext.current
+
+    val needsNotifications = Build.VERSION.SDK_INT >= 33
+    val hasNotificationsPermission = !needsNotifications || ContextCompat.checkSelfPermission(
+        ctx,
+        Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) vm.download() else vm.setUserMessage("Permita notificações para baixar em segundo plano")
+    }
 
     Scaffold(
         topBar = {
@@ -61,6 +83,7 @@ fun DownloadScreen(vm: DownloadViewModel) {
                         onValueChange = vm::setModel,
                         label = { Text("Modelo (SM-)") },
                         singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
@@ -82,6 +105,7 @@ fun DownloadScreen(vm: DownloadViewModel) {
                         onValueChange = vm::setImei,
                         label = { Text("IMEI (15+ dígitos)") },
                         singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.fillMaxWidth()
                     )
 
@@ -137,8 +161,18 @@ fun DownloadScreen(vm: DownloadViewModel) {
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(onClick = vm::check, enabled = !state.busy) { Text("Verificar") }
-                        Button(onClick = vm::download, enabled = !state.busy) { Text("Baixar") }
+                        Button(
+                            onClick = {
+                                if (hasNotificationsPermission) vm.download()
+                                else notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            },
+                            enabled = !state.busy
+                        ) { Text("Baixar") }
                         Button(onClick = vm::cancel, enabled = state.busy) { Text("Cancelar") }
+                    }
+
+                    if (!hasNotificationsPermission) {
+                        Text("Para baixar em segundo plano no Android 13+, permita notificações.")
                     }
                 }
             }

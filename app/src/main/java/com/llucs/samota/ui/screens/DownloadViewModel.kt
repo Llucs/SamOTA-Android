@@ -6,20 +6,34 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.llucs.samota.core.SamotaEngine
 import com.llucs.samota.core.SamotaRequest
+import com.llucs.samota.core.work.DownloadWork
+import com.llucs.samota.core.work.DownloadWorker
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.io.File
-import kotlin.math.roundToInt
 
 class DownloadViewModel(app: Application) : AndroidViewModel(app) {
 
     private val engine = SamotaEngine()
-    private var job: Job? = null
+    private val wm = WorkManager.getInstance(app)
+    private var checkJob: Job? = null
 
     var state by mutableStateOf(DownloadUiState())
         private set
+
+    init {
+        observeDownloadWork()
+    }
 
     private fun update(block: (DownloadUiState) -> DownloadUiState) {
         state = block(state)
@@ -33,17 +47,19 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
     fun setMaxSpeed(v: Double) = update { it.copy(maxSpeedMiB = v) }
     fun setDecrypt(v: Boolean) = update { it.copy(decrypt = v) }
 
+    fun setUserMessage(msg: String?) = update { it.copy(message = msg) }
+
     fun cancel() {
-        job?.cancel()
-        job = null
-        update { it.copy(busy = false, stage = Stage.Idle, message = "Cancelado") }
+        checkJob?.cancel()
+        checkJob = null
+        wm.cancelUniqueWork(DownloadWork.UNIQUE_NAME)
     }
 
     fun check() {
         if (state.busy) return
-        job?.cancel()
+        checkJob?.cancel()
         update { it.copy(busy = true, stage = Stage.Checking, message = null, lastOutput = null) }
-        job = viewModelScope.launch {
+        checkJob = viewModelScope.launch {
             try {
                 val info = engine.check(state.toRequest())
                 update {
@@ -64,7 +80,27 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
 
     fun download() {
         if (state.busy) return
-        job?.cancel()
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val input = workDataOf(
+            DownloadWork.KEY_MODEL to state.model.trim(),
+            DownloadWork.KEY_FIRMWARE to state.firmware.trim(),
+            DownloadWork.KEY_CSC to state.csc.trim(),
+            DownloadWork.KEY_IMEI to state.imei.trim(),
+            DownloadWork.KEY_CONNECTIONS to state.connections.coerceIn(1, 32),
+            DownloadWork.KEY_MAX_SPEED_MIB to state.maxSpeedMiB.coerceAtLeast(0.0),
+            DownloadWork.KEY_DECRYPT to state.decrypt
+        )
+
+        val req = OneTimeWorkRequestBuilder<DownloadWorker>()
+            .addTag(DownloadWork.TAG)
+            .setConstraints(constraints)
+            .setInputData(input)
+            .build()
+
         val outDir = File(getApplication<Application>().getExternalFilesDir(null), "downloads")
         outDir.mkdirs()
 
@@ -72,7 +108,7 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 busy = true,
                 stage = Stage.Downloading,
-                message = "Baixando para: ${outDir.absolutePath}",
+                message = "Download em segundo plano: ${outDir.absolutePath}",
                 lastOutput = null,
                 downloadedBytes = 0L,
                 totalBytes = 0L,
@@ -80,28 +116,67 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
 
-        job = viewModelScope.launch {
-            try {
-                val result = engine.download(
-                    request = state.toRequest(),
-                    outputDir = outDir,
-                    onProgress = { p ->
-                        update {
-                            it.copy(
-                                stage = Stage.Downloading,
-                                downloadedBytes = p.downloadedBytes,
-                                totalBytes = p.totalBytes,
-                                bytesPerSecond = p.bytesPerSecond
-                            )
-                        }
-                    }
-                )
+        wm.enqueueUniqueWork(DownloadWork.UNIQUE_NAME, ExistingWorkPolicy.REPLACE, req)
+    }
+
+    private fun observeDownloadWork() {
+        viewModelScope.launch {
+            wm.getWorkInfosForUniqueWorkFlow(DownloadWork.UNIQUE_NAME).collectLatest { infos ->
+                val info = infos.firstOrNull() ?: return@collectLatest
+                applyWorkInfo(info)
+            }
+        }
+    }
+
+    private fun applyWorkInfo(info: WorkInfo) {
+        val progress = info.progress
+        val output = info.outputData
+
+        fun stageFrom(str: String?): Stage = when (str) {
+            DownloadWork.STAGE_CHECKING -> Stage.Checking
+            DownloadWork.STAGE_DECRYPTING -> Stage.Decrypting
+            DownloadWork.STAGE_DOWNLOADING -> Stage.Downloading
+            DownloadWork.STAGE_DONE -> Stage.Done
+            DownloadWork.STAGE_ERROR -> Stage.Error
+            else -> Stage.Downloading
+        }
+
+        when (info.state) {
+            WorkInfo.State.ENQUEUED -> {
+                update { it.copy(busy = true, stage = Stage.Downloading, message = "Aguardando início…") }
+            }
+            WorkInfo.State.RUNNING -> {
+                val stage = stageFrom(progress.getString(DownloadWork.KEY_STAGE))
+                val downloaded = progress.getLong(DownloadWork.KEY_DOWNLOADED_BYTES, state.downloadedBytes)
+                val total = progress.getLong(DownloadWork.KEY_TOTAL_BYTES, state.totalBytes)
+                val bps = progress.getLong(DownloadWork.KEY_BYTES_PER_SECOND, state.bytesPerSecond)
+                update {
+                    it.copy(
+                        busy = true,
+                        stage = stage,
+                        downloadedBytes = downloaded,
+                        totalBytes = total,
+                        bytesPerSecond = bps,
+                        message = null
+                    )
+                }
+            }
+            WorkInfo.State.SUCCEEDED -> {
+                val stage = stageFrom(output.getString(DownloadWork.KEY_STAGE))
+                val downloadedFile = output.getString(DownloadWork.KEY_DOWNLOADED_FILE)
+                val decryptedFile = output.getString(DownloadWork.KEY_DECRYPTED_FILE)
+                val total = output.getLong(DownloadWork.KEY_TOTAL_BYTES, state.totalBytes)
+                val downloaded = output.getLong(DownloadWork.KEY_DOWNLOADED_BYTES, total)
 
                 val outText = buildString {
-                    append("Arquivo: ").append(result.downloadedFile.name).append('\n')
-                    append("Pasta: ").append(result.downloadedFile.parentFile?.absolutePath ?: "").append('\n')
-                    if (result.decryptedFile != null) {
-                        append("Decriptado: ").append(result.decryptedFile.name).append('\n')
+                    if (!downloadedFile.isNullOrBlank()) {
+                        val f = File(downloadedFile)
+                        append("Arquivo: ").append(f.name).append('\n')
+                        append("Pasta: ").append(f.parentFile?.absolutePath ?: "").append('\n')
+                    }
+                    if (!decryptedFile.isNullOrBlank()) {
+                        val df = File(decryptedFile)
+                        append("Decriptado: ").append(df.name).append('\n')
                     }
                     append("IMEI: ").append(SamotaEngine.maskImei(state.imei))
                 }
@@ -109,17 +184,23 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
                 update {
                     it.copy(
                         busy = false,
-                        stage = Stage.Done,
+                        stage = stage,
                         message = "Concluído",
                         lastOutput = outText,
-                        downloadedBytes = result.firmwareInfo.totalBytes,
-                        totalBytes = result.firmwareInfo.totalBytes,
+                        downloadedBytes = downloaded,
+                        totalBytes = total,
                         bytesPerSecond = 0L
                     )
                 }
-            } catch (e: Exception) {
-                update { it.copy(busy = false, stage = Stage.Error, message = e.message ?: "Erro") }
             }
+            WorkInfo.State.FAILED -> {
+                val msg = output.getString(DownloadWork.KEY_ERROR) ?: "Erro"
+                update { it.copy(busy = false, stage = Stage.Error, message = msg) }
+            }
+            WorkInfo.State.CANCELLED -> {
+                update { it.copy(busy = false, stage = Stage.Idle, message = "Cancelado", bytesPerSecond = 0L) }
+            }
+            WorkInfo.State.BLOCKED -> Unit
         }
     }
 
