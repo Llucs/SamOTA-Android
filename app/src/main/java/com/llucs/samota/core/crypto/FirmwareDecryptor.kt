@@ -33,9 +33,9 @@ object FirmwareDecryptor {
 
         val outFile = File(inputFile.parentFile, outName)
 
-        inputFile.inputStream().buffered(16 * 1024 * 1024).use { fin ->
-            outFile.outputStream().buffered(16 * 1024 * 1024).use { fout ->
-                val buf = ByteArray(16 * 1024 * 1024)
+        inputFile.inputStream().buffered(1024 * 1024).use { fin ->
+            outFile.outputStream().buffered(1024 * 1024).use { fout ->
+                val buf = ByteArray(1024 * 1024)
                 while (true) {
                     val n = fin.read(buf)
                     if (n <= 0) break
