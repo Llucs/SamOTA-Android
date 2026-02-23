@@ -15,7 +15,7 @@ object OkHttpProvider {
         OkHttpClient.Builder()
             .addInterceptor(uaInterceptor)
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(90, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()

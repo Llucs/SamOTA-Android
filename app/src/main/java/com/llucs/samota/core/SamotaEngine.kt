@@ -47,9 +47,11 @@ class SamotaEngine(
     suspend fun download(
         request: SamotaRequest,
         outputDir: File,
-        onProgress: (DownloadProgress) -> Unit
+        onProgress: (DownloadProgress) -> Unit,
+        onStage: (String) -> Unit = {}
     ): SamotaResult = withContext(Dispatchers.IO) {
         validate(request)
+        onStage(EngineStage.CHECKING)
         val fw = FirmwareParts.parse(request.firmware)
 
         val session = fus.openSession()
@@ -61,6 +63,8 @@ class SamotaEngine(
             imei = request.imei
         )
         fus.initBinary(session, info.binaryName, request.csc)
+
+        onStage(EngineStage.DOWNLOADING)
 
         val url = FusConstants.URL_DOWNLOAD + info.modelPath + info.binaryName
         val target = File(outputDir, info.binaryName)
@@ -76,6 +80,7 @@ class SamotaEngine(
         )
 
         val decrypted = if (request.decrypt) {
+            onStage(EngineStage.DECRYPTING)
             FirmwareDecryptor.decryptIfNeeded(
                 inputFile = target,
                 binaryName = info.binaryName,
@@ -84,11 +89,20 @@ class SamotaEngine(
             )
         } else null
 
+        onStage(EngineStage.DONE)
+
         SamotaResult(
             firmwareInfo = info,
             downloadedFile = target,
             decryptedFile = decrypted
         )
+    }
+
+    object EngineStage {
+        const val CHECKING = "CHECKING"
+        const val DOWNLOADING = "DOWNLOADING"
+        const val DECRYPTING = "DECRYPTING"
+        const val DONE = "DONE"
     }
 
     private fun validate(request: SamotaRequest) {
