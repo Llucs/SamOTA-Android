@@ -29,7 +29,9 @@ class DownloadWorker(
         val maxSpeedMiB = inputData.getDouble(DownloadWork.KEY_MAX_SPEED_MIB, 0.0)
         val decrypt = inputData.getBoolean(DownloadWork.KEY_DECRYPT, true)
 
-        val outDir = File(applicationContext.getExternalFilesDir(null), "downloads")
+        val baseDir = applicationContext.getExternalFilesDir(null)
+            ?: applicationContext.filesDir
+        val outDir = File(baseDir, "downloads")
         outDir.mkdirs()
 
         val engine = SamotaEngine()
