@@ -69,7 +69,7 @@ class DownloadWorker(
                         DownloadWork.STAGE_DECRYPTING -> "Decriptando…"
                         else -> "Processando…"
                     }
-                    setForeground(createForeground(title, lastDownloaded, lastTotal))
+                    setForegroundAsync(createForeground(title, lastDownloaded, lastTotal))
                 },
                 onProgress = { p ->
                     val now = System.currentTimeMillis()
@@ -90,7 +90,7 @@ class DownloadWorker(
                             DownloadWork.STAGE_DOWNLOADING -> "Baixando…"
                             else -> "Processando…"
                         }
-                        setForeground(createForeground(title, p.downloadedBytes, p.totalBytes))
+                        setForegroundAsync(createForeground(title, p.downloadedBytes, p.totalBytes))
                     }
                 }
             )
