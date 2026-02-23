@@ -101,7 +101,9 @@ class DownloadViewModel(app: Application) : AndroidViewModel(app) {
             .setInputData(input)
             .build()
 
-        val outDir = File(getApplication<Application>().getExternalFilesDir(null), "downloads")
+        val baseDir = getApplication<Application>().getExternalFilesDir(null)
+            ?: getApplication<Application>().filesDir
+        val outDir = File(baseDir, "downloads")
         outDir.mkdirs()
 
         update {
