@@ -8,7 +8,9 @@ import com.llucs.samota.core.fus.FirmwareParts
 import com.llucs.samota.core.fus.FusClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
+import java.time.Instant
 
 data class SamotaRequest(
     val model: String,
@@ -67,17 +69,34 @@ class SamotaEngine(
         onStage(EngineStage.DOWNLOADING)
 
         val url = FusConstants.URL_DOWNLOAD + info.modelPath + info.binaryName
-        val target = File(outputDir, info.binaryName)
+        val target = File(outputDir, sanitizeFileName(info.binaryName))
 
-        downloader.download(
+        saveLastMetadata(
+            outputDir = outputDir,
+            info = info,
+            url = url,
+            md5Override = info.expectedMd5
+        )
+
+        val downloadResult = downloader.download(
             url = url,
             authHeader = session.authHeader,
             target = target,
             totalBytes = info.totalBytes,
             maxConnections = request.connections,
             maxSpeedMiB = request.maxSpeedMiB,
+            expectedMd5 = info.expectedMd5,
             onProgress = onProgress
         )
+
+        if (info.expectedMd5.isNullOrBlank() && !downloadResult.headerMd5.isNullOrBlank()) {
+            saveLastMetadata(
+                outputDir = outputDir,
+                info = info,
+                url = url,
+                md5Override = downloadResult.headerMd5
+            )
+        }
 
         val decrypted = if (request.decrypt) {
             onStage(EngineStage.DECRYPTING)
@@ -113,6 +132,41 @@ class SamotaEngine(
         if (request.model.isBlank()) throw IllegalArgumentException("Modelo é obrigatório")
         if (request.csc.isBlank()) throw IllegalArgumentException("CSC é obrigatório")
         if (request.firmware.isBlank()) throw IllegalArgumentException("Firmware é obrigatório")
+    }
+
+    private fun sanitizeFileName(rawName: String): String {
+        if (rawName.isBlank()) return "firmware.bin.enc4"
+
+        val base = File(rawName).name
+        val sb = StringBuilder(base.length)
+        for (ch in base) {
+            val safe = (ch in 'a'..'z') || (ch in 'A'..'Z') || (ch in '0'..'9') || ch == '.' || ch == '_' || ch == '-'
+            if (safe) {
+                sb.append(ch)
+            } else if (sb.isEmpty() || sb.last() != '_') {
+                sb.append('_')
+            }
+        }
+
+        val sanitized = sb.toString().trim('_', '.')
+        return if (sanitized.isBlank()) "firmware.bin.enc4" else sanitized
+    }
+
+    private fun saveLastMetadata(
+        outputDir: File,
+        info: FirmwareInfo,
+        url: String,
+        md5Override: String?
+    ) {
+        outputDir.mkdirs()
+        val payload = JSONObject().apply {
+            put("foundVersion", info.foundVersion ?: JSONObject.NULL)
+            put("md5", (md5Override ?: info.expectedMd5) ?: JSONObject.NULL)
+            put("size", info.totalBytes)
+            put("url", url)
+            put("timestamp", Instant.now().toString())
+        }
+        File(outputDir, "last.json").writeText(payload.toString(2))
     }
 
     companion object {
