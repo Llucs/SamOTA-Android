@@ -66,11 +66,16 @@ object FusXml {
         val modelPath = firstDataText(doc, "MODEL_PATH")
         val logicValue = firstDataText(doc, "LOGIC_VALUE_HOME")
         val size = firstDataText(doc, "BINARY_BYTE_SIZE").toLong()
+        val foundVersion = firstDataTextOrNull(doc, "LATEST_FW_VERSION")
+        val expectedMd5 = readExpectedMd5(doc)
+
         return FirmwareInfo(
             binaryName = binName,
             modelPath = modelPath,
             logicValueHome = logicValue,
-            totalBytes = size
+            totalBytes = size,
+            expectedMd5 = expectedMd5,
+            foundVersion = foundVersion
         )
     }
 
@@ -93,5 +98,43 @@ object FusXml {
         val data = node.getElementsByTagName("Data").item(0)
             ?: throw IllegalStateException("Campo ausente: $outerTag/Data")
         return data.textContent.trim()
+    }
+
+    private fun firstDataTextOrNull(doc: Document, outerTag: String): String? {
+        val node = doc.getElementsByTagName(outerTag).item(0) as? Element ?: return null
+        val data = node.getElementsByTagName("Data").item(0) ?: return null
+        return data.textContent?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun readExpectedMd5(doc: Document): String? {
+        val candidates = listOf(
+            "BINARY_MD5",
+            "BINARY_FILE_MD5",
+            "FILE_MD5",
+            "MD5"
+        )
+
+        for (tag in candidates) {
+            val normalized = normalizeMd5(firstDataTextOrNull(doc, tag) ?: firstText(doc, tag))
+            if (normalized != null) return normalized
+        }
+
+        return null
+    }
+
+    private fun normalizeMd5(value: String?): String? {
+        if (value.isNullOrBlank()) return null
+        val trimmed = value.trim().trim('"')
+
+        if (trimmed.length == 32 && trimmed.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+            return trimmed.uppercase()
+        }
+
+        return try {
+            val bytes = android.util.Base64.decode(trimmed, android.util.Base64.DEFAULT)
+            if (bytes.size == 16) bytes.joinToString("") { b -> "%02X".format(b.toInt() and 0xFF) } else null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
     }
 }
