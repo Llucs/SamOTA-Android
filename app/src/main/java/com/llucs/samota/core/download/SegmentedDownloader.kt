@@ -13,14 +13,24 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
+import java.io.FileInputStream
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.coroutines.coroutineContext
 
 class SegmentedDownloader {
+
+    data class Result(
+        val file: File,
+        val resumed: Boolean,
+        val headerMd5: String?,
+        val verifiedMd5: String?
+    )
 
     private val client = OkHttpProvider.client
 
@@ -31,21 +41,43 @@ class SegmentedDownloader {
         totalBytes: Long,
         maxConnections: Int,
         maxSpeedMiB: Double,
+        expectedMd5: String? = null,
         onProgress: (DownloadProgress) -> Unit
-    ) = withContext(Dispatchers.IO) {
+    ): Result = withContext(Dispatchers.IO) {
 
         if (totalBytes <= 0) throw IllegalArgumentException("Tamanho inválido")
 
+        val normalizedExpectedMd5 = normalizeMd5(expectedMd5)
         val finalFile = target
         if (finalFile.exists() && finalFile.length() == totalBytes) {
-            onProgress(DownloadProgress(downloadedBytes = totalBytes, totalBytes = totalBytes, bytesPerSecond = 0))
-            return@withContext
+            val verified = if (!normalizedExpectedMd5.isNullOrBlank()) {
+                val computed = computeMd5Hex(finalFile)
+                if (!computed.equals(normalizedExpectedMd5, ignoreCase = true)) {
+                    finalFile.delete()
+                    null
+                } else {
+                    computed
+                }
+            } else {
+                null
+            }
+
+            if (finalFile.exists()) {
+                onProgress(DownloadProgress(downloadedBytes = totalBytes, totalBytes = totalBytes, bytesPerSecond = 0))
+                return@withContext Result(
+                    file = finalFile,
+                    resumed = false,
+                    headerMd5 = null,
+                    verifiedMd5 = verified
+                )
+            }
         }
 
         finalFile.parentFile?.mkdirs()
 
         val partFile = File(finalFile.absolutePath + PART_SUFFIX)
         val mapFile = File(partFile.absolutePath + MAP_SUFFIX)
+        val headerMd5Ref = AtomicReference<String?>(null)
 
         RandomAccessFile(partFile, "rw").use { raf ->
             raf.setLength(totalBytes)
@@ -64,6 +96,8 @@ class SegmentedDownloader {
                 mapFile.delete()
             }
         }
+
+        var resumedFromPartial = false
 
         RandomAccessFile(mapFile, "rw").use { mapRaf ->
             mapRaf.setLength(chunkCount.toLong())
@@ -85,12 +119,19 @@ class SegmentedDownloader {
                     chunksToDownload.add(i)
                 }
             }
+            resumedFromPartial = doneBytes > 0L
             totalDownloaded.set(doneBytes)
 
             if (chunksToDownload.isEmpty()) {
                 finishDownload(partFile, mapFile, finalFile)
+                val verifiedMd5 = verifyMd5IfAvailable(finalFile, normalizedExpectedMd5, headerMd5Ref.get())
                 onProgress(DownloadProgress(downloadedBytes = totalBytes, totalBytes = totalBytes, bytesPerSecond = 0))
-                return@withContext
+                return@withContext Result(
+                    file = finalFile,
+                    resumed = resumedFromPartial,
+                    headerMd5 = headerMd5Ref.get(),
+                    verifiedMd5 = verifiedMd5
+                )
             }
 
             val semaphore = Semaphore(maxConnections.coerceIn(1, 32))
@@ -130,6 +171,11 @@ class SegmentedDownloader {
                                         }
                                     }
                                 },
+                                onHeaderMd5 = { headerMd5 ->
+                                    if (!headerMd5.isNullOrBlank()) {
+                                        headerMd5Ref.compareAndSet(null, headerMd5)
+                                    }
+                                },
                                 onBytes = { n ->
                                     synchronized(progressLock) {
                                         perChunkDownloaded[idx] += n.toLong()
@@ -165,7 +211,15 @@ class SegmentedDownloader {
         }
 
         finishDownload(partFile, mapFile, finalFile)
+        val headerMd5 = headerMd5Ref.get()
+        val verifiedMd5 = verifyMd5IfAvailable(finalFile, normalizedExpectedMd5, headerMd5)
         onProgress(DownloadProgress(downloadedBytes = totalBytes, totalBytes = totalBytes, bytesPerSecond = 0))
+        Result(
+            file = finalFile,
+            resumed = resumedFromPartial,
+            headerMd5 = headerMd5,
+            verifiedMd5 = verifiedMd5
+        )
     }
 
     private suspend fun downloadChunkWithRetry(
@@ -176,6 +230,7 @@ class SegmentedDownloader {
         totalBytes: Long,
         bucket: TokenBucket,
         onRetryStart: () -> Unit,
+        onHeaderMd5: (String?) -> Unit,
         onBytes: (Int) -> Unit,
         maxRetries: Int = 5
     ) {
@@ -186,7 +241,7 @@ class SegmentedDownloader {
         while (true) {
             onRetryStart()
             try {
-                downloadRange(url, authHeader, file, range.first, range.last, bucket, onBytes)
+                downloadRange(url, authHeader, file, range.first, range.last, bucket, onHeaderMd5, onBytes)
                 return
             } catch (e: CancellationException) {
                 throw e
@@ -206,6 +261,7 @@ class SegmentedDownloader {
         start: Long,
         end: Long,
         bucket: TokenBucket,
+        onHeaderMd5: (String?) -> Unit,
         onBytes: (Int) -> Unit
     ) {
         val req = Request.Builder()
@@ -220,6 +276,8 @@ class SegmentedDownloader {
             if (!(resp.isSuccessful && (resp.code == 206 || resp.code == 200))) {
                 throw IllegalStateException("HTTP ${resp.code}")
             }
+
+            onHeaderMd5(normalizeMd5(resp.header("x-amz-meta-md5")))
 
             val body = resp.body ?: throw IllegalStateException("Resposta vazia")
             body.byteStream().use { input ->
@@ -261,6 +319,45 @@ class SegmentedDownloader {
             partFile.delete()
         }
         mapFile.delete()
+    }
+
+    private fun verifyMd5IfAvailable(finalFile: File, expectedMd5: String?, headerMd5: String?): String? {
+        val md5ToValidate = expectedMd5 ?: headerMd5
+        if (md5ToValidate.isNullOrBlank()) return null
+
+        val computed = computeMd5Hex(finalFile)
+        if (!computed.equals(md5ToValidate, ignoreCase = true)) {
+            finalFile.delete()
+            throw IllegalStateException("MD5 inválido. Esperado $md5ToValidate, obtido $computed")
+        }
+        return computed
+    }
+
+    private fun computeMd5Hex(file: File): String {
+        val md = MessageDigest.getInstance("MD5")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val n = input.read(buffer)
+                if (n <= 0) break
+                md.update(buffer, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { b -> "%02X".format(b.toInt() and 0xFF) }
+    }
+
+    private fun normalizeMd5(value: String?): String? {
+        if (value.isNullOrBlank()) return null
+        val trimmed = value.trim().trim('"')
+        if (trimmed.length == 32 && trimmed.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+            return trimmed.uppercase()
+        }
+        return try {
+            val bytes = android.util.Base64.decode(trimmed, android.util.Base64.DEFAULT)
+            if (bytes.size == 16) bytes.joinToString("") { b -> "%02X".format(b.toInt() and 0xFF) } else null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
     }
 
     companion object {
